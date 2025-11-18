@@ -4,7 +4,7 @@ import sys
 
 print("测试 1: 导入模块...")
 try:
-    from chunk2milvus import MilvusClient, EmbeddingService
+    from chunk2milvus_hq import MilvusClient, EmbeddingService
     print("✓ 模块导入成功")
 except Exception as e:
     print(f"✗ 模块导入失败: {e}")

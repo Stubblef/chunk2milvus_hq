@@ -82,14 +82,20 @@ class MilvusClient:
         
         # 建立连接
         # 优先使用 host:port 方式连接（更可靠，适用于所有 Milvus 部署）
+        # connections.connect() 不返回有意义的值（通常返回 None），
+        # 它通过副作用建立连接并存储在 connections 对象中
         # 如果连接已存在，先断开再连接
         try:
-            connections.connect(
+            result = connections.connect(
                 alias=alias,
                 host=host,
                 port=port,
                 token=self.token
             )
+            # result 通常是 None，连接信息存储在 connections 对象中
+            # 可以通过 connections.get_connection_addr(alias) 验证连接
+            # 返回格式: {'address': 'host:port', 'user': 'username'}
+            # user 字段：用于用户名/密码认证时的用户名，使用 token 认证时为空字符串
         except Exception as e:
             # 如果连接已存在，先断开再连接
             try:
@@ -179,6 +185,36 @@ class MilvusClient:
             collection 名称列表
         """
         return utility.list_collections()
+
+    def check_connection(self) -> bool:
+        """
+        检查连接是否有效
+        
+        Returns:
+            连接是否有效
+        """
+        try:
+            # 尝试获取连接地址，如果连接存在会返回地址
+            # 返回格式: {'address': 'host:port', 'user': 'username'}
+            # user 字段：用于用户名/密码认证时的用户名，使用 token 认证时为空字符串
+            addr_info = connections.get_connection_addr(self.alias)
+            return addr_info is not None and 'address' in addr_info
+        except Exception:
+            return False
+
+    def get_connection_info(self) -> Dict[str, str]:
+        """
+        获取连接信息
+        
+        Returns:
+            连接信息字典，包含 address 和 user 字段
+            - address: 连接地址 (host:port)
+            - user: 用户名（使用 token 认证时为空字符串）
+        """
+        try:
+            return connections.get_connection_addr(self.alias)
+        except Exception:
+            return {}
 
     def get_collection(self, collection_name: str) -> Collection:
         """
