@@ -128,12 +128,26 @@ class MilvusClient:
             
         Returns:
             Collection 对象
+            
+        
+        examples:
+        # 定义字段 schema
+        fields = [
+            FieldSchema(name="pk", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, max_length=1024),
+            FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=256),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535, enable_analyzer=True),
+            FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim),
+            FieldSchema(name="metadata", dtype=DataType.JSON)
+        ]    
+        
         """
         # 检查 collection 是否已存在
         if self.has_collection(collection_name):
             raise ValueError(f"Collection '{collection_name}' already exists")
         
         # 创建 schema
+        
+        
         schema = CollectionSchema(
             fields=fields,
             description=description,
@@ -331,8 +345,9 @@ class MilvusClient:
                     "embedding_service is required for auto embedding. "
                     "Either provide embedding_service or set auto_embed=False"
                 )
-            # 批量向量化
-            vectors = self.embedding_service.embeddings(texts)
+            # 批量向量化（自动分批处理，每批最多 10 个）
+            print(f"  正在向量化 {num_texts} 个文本块...")
+            vectors = self.embedding_service.embeddings(texts, batch_size=10, show_progress=True)
             insert_data["dense_vector"] = vectors
         
         # 添加 metadata 字段
