@@ -7,6 +7,7 @@ from pymilvus import (
     DataType,
     connections,
     utility,
+    db,
 )
 from .embedding import EmbeddingService
 
@@ -19,7 +20,8 @@ class MilvusClient:
         uri: Optional[str] = None,
         token: Optional[str] = None,
         embedding_service: Optional[EmbeddingService] = None,
-        alias: str = "default"
+        alias: str = "default",
+        database: Optional[str] = None
     ):
         """
         初始化 Milvus 客户端
@@ -30,12 +32,14 @@ class MilvusClient:
             token: 认证 token（可选），如果为 None 则从环境变量 MILVUS_TOKEN 读取
             embedding_service: 向量化服务实例（可选）
             alias: 连接别名，默认为 "default"
+            database: 数据库名称（可选），如果为 None 则从环境变量 MILVUS_DATABASE 读取，默认为 "default"
         """
         # 从环境变量读取配置
         raw_uri = uri or os.getenv("MILVUS_URI", "http://localhost:19530")
         self.token = token or os.getenv("MILVUS_TOKEN")
         self.alias = alias
         self.embedding_service = embedding_service
+        self.database = database or os.getenv("MILVUS_DATABASE", "default")
         
         # 规范化 URI 格式
         # 如果 URI 不包含协议，自动添加 http://
@@ -90,7 +94,8 @@ class MilvusClient:
                 alias=alias,
                 host=host,
                 port=port,
-                token=self.token
+                token=self.token,
+                db_name=self.database
             )
             # result 通常是 None，连接信息存储在 connections 对象中
             # 可以通过 connections.get_connection_addr(alias) 验证连接
@@ -104,11 +109,21 @@ class MilvusClient:
                     alias=alias,
                     host=host,
                     port=port,
-                    token=self.token
+                    token=self.token,
+                    db_name=self.database
                 )
             except Exception as reconnect_error:
                 # 如果重新连接失败，抛出原始错误
                 raise e from reconnect_error
+        
+        # 确保使用指定的数据库
+        # 如果连接时指定了 db_name，通常不需要再次切换，但为了确保，可以显式切换
+        try:
+            db.using_database(self.database, using=alias)
+        except Exception:
+            # 如果切换失败（可能是数据库不存在或已经在该数据库），忽略错误
+            # 因为连接时已经指定了 db_name
+            pass
 
     def create_collection(
         self,
