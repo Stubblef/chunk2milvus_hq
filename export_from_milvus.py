@@ -13,7 +13,8 @@ import argparse
 import json
 import csv
 import sys
-from typing import List, Dict, Any, Optional
+import gc
+from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
 
 from chunk2milvus_hq import MilvusClient
@@ -24,8 +25,9 @@ def query_collection(
     collection_name: str,
     limit: Optional[int] = None,
     fields: Optional[List[str]] = None,
-    expr: Optional[str] = None
-) -> List[Dict[str, Any]]:
+    expr: Optional[str] = None,
+    batch_callback: Optional[Callable[[List[Dict[str, Any]]], None]] = None
+) -> Optional[List[Dict[str, Any]]]:
     """
     从 collection 查询数据
     
@@ -35,9 +37,11 @@ def query_collection(
         limit: 查询数量限制，None 表示查询全部
         fields: 要查询的字段列表，None 表示查询所有字段
         expr: 过滤表达式（可选）
+        batch_callback: 批次回调函数，每批数据查询后立即调用（用于流式处理）
+                       如果提供，函数返回 None，否则返回所有结果列表
         
     Returns:
-        查询结果列表
+        查询结果列表（如果 batch_callback 为 None），否则返回 None
     """
     collection = client.get_collection(collection_name)
     
@@ -155,7 +159,13 @@ def query_collection(
                             limit=min(data_batch_size, remaining)
                         )
                     
-                    results.extend(batch_results)
+                    # 如果提供了回调函数，立即处理这批数据（流式处理）
+                    if batch_callback:
+                        batch_callback(batch_results)
+                        del batch_results  # 立即释放内存
+                        gc.collect()  # 强制垃圾回收
+                    else:
+                        results.extend(batch_results)
                     remaining -= len(batch_results)
                     
                     if remaining <= 0 or len(batch_results) < data_batch_size:
@@ -176,18 +186,30 @@ def query_collection(
                     if not batch_results:
                         break
                     
-                    results.extend(batch_results)
+                    # 如果提供了回调函数，立即处理这批数据（流式处理）
+                    if batch_callback:
+                        batch_callback(batch_results)
+                        del batch_results  # 立即释放内存
+                        gc.collect()  # 强制垃圾回收
+                    else:
+                        results.extend(batch_results)
                     remaining -= len(batch_results)
                     
                     if len(batch_results) < batch_limit:
                         break
         else:
             # limit 在允许范围内，直接查询
-            results = collection.query(
+            batch_results = collection.query(
                 expr=expr if expr else "",
                 output_fields=fields,
                 limit=limit
             )
+            # 如果提供了回调函数，立即处理
+            if batch_callback:
+                batch_callback(batch_results)
+                return None
+            else:
+                results = batch_results
     else:
         # 导出全部数据，需要分批查询
         num_entities = collection.num_entities
@@ -197,7 +219,7 @@ def query_collection(
             return []
         
         print("  正在分批查询所有数据（可能需要一些时间）...")
-        results = []
+        results = [] if batch_callback is None else None
         batch_num = 0
         total_queried = 0
         
@@ -210,7 +232,7 @@ def query_collection(
         
         if pk_field:
             # 使用主键分批查询
-            # 先分批获取所有主键
+            # 先分批获取所有主键（流式处理，不全部保存在内存）
             print("  正在获取主键列表...")
             all_pks = []
             pk_batch_size = MAX_QUERY_LIMIT
@@ -286,7 +308,15 @@ def query_collection(
                         limit=len(batch_pks)
                     )
                 
-                results.extend(batch_results)
+                # 如果提供了回调函数，立即处理这批数据（流式处理）
+                if batch_callback:
+                    batch_callback(batch_results)
+                    del batch_results  # 立即释放内存
+                    # 每10批执行一次垃圾回收，避免频繁GC影响性能
+                    if batch_num % 10 == 0:
+                        gc.collect()
+                else:
+                    results.extend(batch_results)
         else:
             # 没有主键字段，使用简单分批查询（可能无法完全避免重复）
             print("  警告: 未找到主键字段，使用简单分批查询（可能无法完全避免重复数据）")
@@ -305,7 +335,15 @@ def query_collection(
                 if not batch_results:
                     break
                 
-                results.extend(batch_results)
+                # 如果提供了回调函数，立即处理这批数据（流式处理）
+                if batch_callback:
+                    batch_callback(batch_results)
+                    del batch_results  # 立即释放内存
+                    # 每10批执行一次垃圾回收
+                    if batch_num % 10 == 0:
+                        gc.collect()
+                else:
+                    results.extend(batch_results)
                 total_queried += len(batch_results)
                 
                 if len(batch_results) < batch_limit:
@@ -314,15 +352,82 @@ def query_collection(
     return results
 
 
+class StreamingJSONWriter:
+    """流式 JSON 写入器"""
+    def __init__(self, output_file: str):
+        self.output_file = output_file
+        self.file = open(output_file, 'w', encoding='utf-8')
+        self.file.write('[\n')
+        self.first_item = True
+        self.count = 0
+    
+    def write(self, data: List[Dict[str, Any]]):
+        """写入一批数据"""
+        for item in data:
+            if not self.first_item:
+                self.file.write(',\n')
+            json.dump(item, self.file, ensure_ascii=False, indent=2)
+            self.first_item = False
+            self.count += 1
+    
+    def close(self):
+        """关闭文件"""
+        self.file.write('\n]')
+        self.file.close()
+        print(f"数据已导出到 JSON 文件: {self.output_file} (共 {self.count} 条)")
+
+
+class StreamingCSVWriter:
+    """流式 CSV 写入器"""
+    def __init__(self, output_file: str, fieldnames: Optional[List[str]] = None):
+        self.output_file = output_file
+        self.file = open(output_file, 'w', encoding='utf-8', newline='')
+        self.fieldnames = fieldnames
+        self.writer = None
+        self.header_written = False
+        self.count = 0
+    
+    def write(self, data: List[Dict[str, Any]]):
+        """写入一批数据"""
+        if not data:
+            return
+        
+        # 第一次写入时，确定字段名并写入表头
+        if not self.header_written:
+            if self.fieldnames is None:
+                self.fieldnames = list(data[0].keys())
+            self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+            self.writer.writeheader()
+            self.header_written = True
+        
+        # 写入数据
+        for row in data:
+            # 处理复杂数据类型（如列表、字典）转换为字符串
+            processed_row = {}
+            for key, value in row.items():
+                if key in self.fieldnames:
+                    if isinstance(value, (list, dict)):
+                        processed_row[key] = json.dumps(value, ensure_ascii=False)
+                    else:
+                        processed_row[key] = value
+            self.writer.writerow(processed_row)
+            self.count += 1
+    
+    def close(self):
+        """关闭文件"""
+        self.file.close()
+        print(f"数据已导出到 CSV 文件: {self.output_file} (共 {self.count} 条)")
+
+
 def export_to_json(data: List[Dict[str, Any]], output_file: str):
-    """导出数据到 JSON 文件"""
+    """导出数据到 JSON 文件（兼容旧接口）"""
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"数据已导出到 JSON 文件: {output_file}")
 
 
 def export_to_csv(data: List[Dict[str, Any]], output_file: str):
-    """导出数据到 CSV 文件"""
+    """导出数据到 CSV 文件（兼容旧接口）"""
     if not data:
         print("警告: 没有数据可导出")
         return
@@ -367,6 +472,9 @@ def main():
 
   # 指定数据库名称
   python export_from_milvus.py -c my_collection -d test -n 100 -f json
+
+  # 大数据量导出，每100批保存一个文件（避免内存溢出）
+  python export_from_milvus.py -c my_collection --batch-save 100 -f json -o output.json
         """
     )
     
@@ -433,6 +541,13 @@ def main():
         help="过滤表达式（可选，例如: 'doc_id == \"doc1\"'）"
     )
     
+    parser.add_argument(
+        "--batch-save",
+        type=int,
+        default=0,
+        help="每N批数据保存一个文件（0表示不分批，全部保存到一个文件）。用于大数据量导出，避免内存溢出"
+    )
+    
     args = parser.parse_args()
     
     # 处理 limit 参数
@@ -494,28 +609,122 @@ def main():
         if args.fields:
             print(f"导出字段: {', '.join(args.fields)}")
         
-        data = query_collection(
-            client=client,
-            collection_name=args.collection,
-            limit=limit,
-            fields=args.fields,
-            expr=args.expr
-        )
+        # 确定是否使用流式写入（大数据量或指定了分批保存）
+        use_streaming = (limit is None or limit > 10000) or args.batch_save > 0
         
-        print(f"\n查询到 {len(data)} 条数据")
-        
-        if not data:
-            print("警告: 没有数据可导出")
-            sys.exit(0)
-        
-        # 导出数据
-        print(f"\n正在导出数据到 {args.format.upper()} 文件...")
-        if args.format == "json":
-            export_to_json(data, output_file)
+        if use_streaming:
+            # 使用流式写入，避免内存溢出
+            print("  使用流式写入模式（避免内存溢出）...")
+            
+            # 获取字段列表（用于CSV写入器）
+            if args.fields:
+                fieldnames = args.fields
+            else:
+                # 需要从collection schema获取字段列表
+                collection = client.get_collection(args.collection)
+                collection.load()
+                schema_fields = {field.name: field for field in collection.schema.fields}
+                fieldnames = [name for name, field in schema_fields.items()]
+            
+            # 创建写入器
+            if args.batch_save > 0:
+                # 分批保存文件
+                file_counter = 1
+                batch_counter = 0
+                current_writer = None
+                
+                def batch_callback(batch_data: List[Dict[str, Any]]):
+                    nonlocal file_counter, batch_counter, current_writer
+                    
+                    if current_writer is None:
+                        # 创建新文件
+                        base_name = Path(output_file).stem
+                        base_ext = Path(output_file).suffix or f".{args.format}"
+                        base_dir = Path(output_file).parent
+                        new_file = base_dir / f"{base_name}_part{file_counter:04d}{base_ext}"
+                        print(f"\n  开始写入文件: {new_file}")
+                        
+                        if args.format == "json":
+                            current_writer = StreamingJSONWriter(str(new_file))
+                        else:
+                            current_writer = StreamingCSVWriter(str(new_file), fieldnames)
+                    
+                    # 写入数据
+                    current_writer.write(batch_data)
+                    batch_counter += 1
+                    
+                    # 如果达到批次数量，关闭当前文件并创建新文件
+                    if batch_counter >= args.batch_save:
+                        current_writer.close()
+                        current_writer = None
+                        file_counter += 1
+                        batch_counter = 0
+                
+                # 查询数据（使用回调）
+                query_collection(
+                    client=client,
+                    collection_name=args.collection,
+                    limit=limit,
+                    fields=args.fields,
+                    expr=args.expr,
+                    batch_callback=batch_callback
+                )
+                
+                # 关闭最后一个文件
+                if current_writer is not None:
+                    current_writer.close()
+                
+                print(f"\n导出完成！共生成 {file_counter} 个文件")
+            else:
+                # 流式写入到单个文件
+                if args.format == "json":
+                    writer = StreamingJSONWriter(output_file)
+                else:
+                    writer = StreamingCSVWriter(output_file, fieldnames)
+                
+                def batch_callback(batch_data: List[Dict[str, Any]]):
+                    writer.write(batch_data)
+                
+                # 查询数据（使用回调）
+                query_collection(
+                    client=client,
+                    collection_name=args.collection,
+                    limit=limit,
+                    fields=args.fields,
+                    expr=args.expr,
+                    batch_callback=batch_callback
+                )
+                
+                # 关闭文件
+                writer.close()
+                print(f"\n导出完成！")
         else:
-            export_to_csv(data, output_file)
-        
-        print(f"\n导出完成！共导出 {len(data)} 条数据")
+            # 小数据量，使用传统方式（全部加载到内存）
+            data = query_collection(
+                client=client,
+                collection_name=args.collection,
+                limit=limit,
+                fields=args.fields,
+                expr=args.expr
+            )
+            
+            if data is None:
+                data = []
+            
+            print(f"\n查询到 {len(data)} 条数据")
+            
+            if not data:
+                print("警告: 没有数据可导出")
+                sys.exit(0)
+            
+            # 导出数据
+            print(f"\n正在导出数据到 {args.format.upper()} 文件...")
+            if args.format == "json":
+                export_to_json(data, output_file)
+            else:
+                export_to_csv(data, output_file)
+            
+            print(f"\n导出完成！共导出 {len(data)} 条数据")
         
     except KeyboardInterrupt:
         print("\n\n操作已取消")
