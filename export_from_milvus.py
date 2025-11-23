@@ -568,8 +568,13 @@ def main():
     else:
         output_file = f"{args.collection}.{args.format}"
     
-    # 检查输出文件是否已存在
-    if Path(output_file).exists():
+    # 确保输出目录存在（如果指定了目录）
+    output_path = Path(output_file)
+    if output_path.parent and str(output_path.parent) != '.':
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 检查输出文件是否已存在（仅在非分批保存模式下检查）
+    if args.batch_save == 0 and Path(output_file).exists():
         response = input(f"文件 {output_file} 已存在，是否覆盖？(y/N): ")
         if response.lower() != 'y':
             print("操作已取消")
@@ -638,9 +643,15 @@ def main():
                     
                     if current_writer is None:
                         # 创建新文件
-                        base_name = Path(output_file).stem
-                        base_ext = Path(output_file).suffix or f".{args.format}"
-                        base_dir = Path(output_file).parent
+                        output_path = Path(output_file)
+                        base_name = output_path.stem
+                        base_ext = output_path.suffix or f".{args.format}"
+                        base_dir = output_path.parent
+                        
+                        # 确保目录存在
+                        if base_dir and str(base_dir) != '.':
+                            base_dir.mkdir(parents=True, exist_ok=True)
+                        
                         new_file = base_dir / f"{base_name}_part{file_counter:04d}{base_ext}"
                         print(f"\n  开始写入文件: {new_file}")
                         
