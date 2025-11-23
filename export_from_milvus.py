@@ -59,26 +59,257 @@ def query_collection(
     
     # 执行查询
     # pymilvus 的 query 方法支持 limit 和 expr 参数
+    # 注意：Milvus 的 query 方法限制 limit 最大为 16384
+    MAX_QUERY_LIMIT = 16384
+    
     if limit is not None and limit > 0:
-        results = collection.query(
-            expr=expr if expr else "",
-            output_fields=fields,
-            limit=limit
-        )
+        # 如果 limit 超过最大值，需要分批查询
+        if limit > MAX_QUERY_LIMIT:
+            print(f"  注意: limit ({limit}) 超过 Milvus 最大限制 ({MAX_QUERY_LIMIT})，将分批查询...")
+            results = []
+            remaining = limit
+            batch_num = 0
+            
+            # 获取主键字段用于分批查询
+            pk_field = None
+            for field in collection.schema.fields:
+                if field.is_primary:
+                    pk_field = field.name
+                    break
+            
+            if pk_field:
+                # 使用主键范围查询来分批获取数据
+                # 先获取所有主键（分批获取）
+                all_pks = []
+                pk_batch_size = MAX_QUERY_LIMIT
+                pk_offset = 0
+                
+                while pk_offset < limit:
+                    pk_batch_limit = min(pk_batch_size, limit - pk_offset)
+                    pk_batch = collection.query(
+                        expr=expr if expr else "",
+                        output_fields=[pk_field],
+                        limit=pk_batch_limit
+                    )
+                    
+                    if not pk_batch:
+                        break
+                    
+                    all_pks.extend([row[pk_field] for row in pk_batch])
+                    pk_offset += len(pk_batch)
+                    
+                    if len(pk_batch) < pk_batch_limit:
+                        break
+                
+                # 使用主键列表分批查询数据
+                # 使用较小的批次以避免表达式过长（表达式长度限制）
+                data_batch_size = min(1000, MAX_QUERY_LIMIT)  # 使用较小的批次
+                for i in range(0, len(all_pks), data_batch_size):
+                    batch_pks = all_pks[i:i + data_batch_size]
+                    batch_num += 1
+                    print(f"  正在查询第 {batch_num} 批数据 ({len(batch_pks)} 条)...")
+                    
+                    # 构建主键过滤表达式
+                    if pk_field:
+                        # 根据主键类型构建表达式
+                        pk_field_type = next((f.dtype for f in collection.schema.fields if f.name == pk_field), None)
+                        if pk_field_type and pk_field_type.name in ["INT64", "VARCHAR"]:
+                            try:
+                                if pk_field_type.name == "VARCHAR":
+                                    # VARCHAR 类型使用 in 表达式
+                                    pk_list_str = ", ".join([f'"{pk}"' for pk in batch_pks])
+                                    batch_expr = f"{pk_field} in [{pk_list_str}]"
+                                else:
+                                    # INT64 类型
+                                    pk_list_str = ", ".join([str(pk) for pk in batch_pks])
+                                    batch_expr = f"{pk_field} in [{pk_list_str}]"
+                                
+                                # 如果原有 expr，需要合并
+                                if expr:
+                                    batch_expr = f"({expr}) && ({batch_expr})"
+                                
+                                batch_results = collection.query(
+                                    expr=batch_expr,
+                                    output_fields=fields,
+                                    limit=len(batch_pks)
+                                )
+                            except Exception as e:
+                                # 如果表达式过长或其他错误，回退到简单查询
+                                print(f"    警告: 使用主键表达式查询失败，回退到简单查询: {e}")
+                                batch_results = collection.query(
+                                    expr=expr if expr else "",
+                                    output_fields=fields,
+                                    limit=min(data_batch_size, remaining)
+                                )
+                        else:
+                            # 如果无法构建表达式，直接查询（可能重复）
+                            batch_results = collection.query(
+                                expr=expr if expr else "",
+                                output_fields=fields,
+                                limit=min(data_batch_size, remaining)
+                            )
+                    else:
+                        batch_results = collection.query(
+                            expr=expr if expr else "",
+                            output_fields=fields,
+                            limit=min(data_batch_size, remaining)
+                        )
+                    
+                    results.extend(batch_results)
+                    remaining -= len(batch_results)
+                    
+                    if remaining <= 0 or len(batch_results) < data_batch_size:
+                        break
+            else:
+                # 没有主键字段，直接分批查询（可能重复）
+                while remaining > 0:
+                    batch_num += 1
+                    batch_limit = min(MAX_QUERY_LIMIT, remaining)
+                    print(f"  正在查询第 {batch_num} 批数据 (最多 {batch_limit} 条)...")
+                    
+                    batch_results = collection.query(
+                        expr=expr if expr else "",
+                        output_fields=fields,
+                        limit=batch_limit
+                    )
+                    
+                    if not batch_results:
+                        break
+                    
+                    results.extend(batch_results)
+                    remaining -= len(batch_results)
+                    
+                    if len(batch_results) < batch_limit:
+                        break
+        else:
+            # limit 在允许范围内，直接查询
+            results = collection.query(
+                expr=expr if expr else "",
+                output_fields=fields,
+                limit=limit
+            )
     else:
-        # 导出全部数据
-        # 先获取总数
+        # 导出全部数据，需要分批查询
         num_entities = collection.num_entities
         print(f"Collection 总共有 {num_entities} 条数据")
         
-        # Milvus 的 query 方法不支持 offset，但可以通过设置一个很大的 limit 来获取所有数据
-        # 设置 limit 为总数 + 1000 以确保获取所有数据
-        print("  正在查询所有数据（可能需要一些时间）...")
-        results = collection.query(
-            expr=expr if expr else "",
-            output_fields=fields,
-            limit=num_entities + 1000  # 设置一个比总数稍大的 limit 以确保获取所有数据
-        )
+        if num_entities == 0:
+            return []
+        
+        print("  正在分批查询所有数据（可能需要一些时间）...")
+        results = []
+        batch_num = 0
+        total_queried = 0
+        
+        # 获取主键字段用于分批查询
+        pk_field = None
+        for field in collection.schema.fields:
+            if field.is_primary:
+                pk_field = field.name
+                break
+        
+        if pk_field:
+            # 使用主键分批查询
+            # 先分批获取所有主键
+            print("  正在获取主键列表...")
+            all_pks = []
+            pk_batch_size = MAX_QUERY_LIMIT
+            pk_offset = 0
+            
+            while pk_offset < num_entities:
+                pk_batch_limit = min(pk_batch_size, num_entities - pk_offset)
+                pk_batch = collection.query(
+                    expr=expr if expr else "",
+                    output_fields=[pk_field],
+                    limit=pk_batch_limit
+                )
+                
+                if not pk_batch:
+                    break
+                
+                batch_pks = [row[pk_field] for row in pk_batch]
+                all_pks.extend(batch_pks)
+                pk_offset += len(pk_batch)
+                
+                print(f"    已获取 {len(all_pks)}/{num_entities} 个主键...")
+                
+                if len(pk_batch) < pk_batch_limit:
+                    break
+            
+            # 使用主键列表分批查询数据
+            # 使用较小的批次以避免表达式过长（表达式长度限制）
+            data_batch_size = min(1000, MAX_QUERY_LIMIT)  # 使用较小的批次
+            for i in range(0, len(all_pks), data_batch_size):
+                batch_pks = all_pks[i:i + data_batch_size]
+                batch_num += 1
+                total_queried += len(batch_pks)
+                print(f"  正在查询第 {batch_num} 批数据 ({len(batch_pks)} 条, 进度: {total_queried}/{len(all_pks)})...")
+                
+                # 构建主键过滤表达式
+                pk_field_type = next((f.dtype for f in collection.schema.fields if f.name == pk_field), None)
+                if pk_field_type:
+                    try:
+                        if pk_field_type.name == "VARCHAR":
+                            # VARCHAR 类型使用 in 表达式
+                            pk_list_str = ", ".join([f'"{pk}"' for pk in batch_pks])
+                            batch_expr = f"{pk_field} in [{pk_list_str}]"
+                        elif pk_field_type.name == "INT64":
+                            # INT64 类型
+                            pk_list_str = ", ".join([str(pk) for pk in batch_pks])
+                            batch_expr = f"{pk_field} in [{pk_list_str}]"
+                        else:
+                            # 其他类型，尝试转换为字符串
+                            pk_list_str = ", ".join([f'"{str(pk)}"' for pk in batch_pks])
+                            batch_expr = f"{pk_field} in [{pk_list_str}]"
+                        
+                        # 如果原有 expr，需要合并
+                        if expr:
+                            batch_expr = f"({expr}) && ({batch_expr})"
+                        
+                        batch_results = collection.query(
+                            expr=batch_expr,
+                            output_fields=fields,
+                            limit=len(batch_pks)
+                        )
+                    except Exception as e:
+                        # 如果表达式过长或其他错误，回退到简单查询
+                        print(f"    警告: 使用主键表达式查询失败，回退到简单查询: {e}")
+                        batch_results = collection.query(
+                            expr=expr if expr else "",
+                            output_fields=fields,
+                            limit=len(batch_pks)
+                        )
+                else:
+                    batch_results = collection.query(
+                        expr=expr if expr else "",
+                        output_fields=fields,
+                        limit=len(batch_pks)
+                    )
+                
+                results.extend(batch_results)
+        else:
+            # 没有主键字段，使用简单分批查询（可能无法完全避免重复）
+            print("  警告: 未找到主键字段，使用简单分批查询（可能无法完全避免重复数据）")
+            batch_size = MAX_QUERY_LIMIT
+            while total_queried < num_entities:
+                batch_num += 1
+                batch_limit = min(batch_size, num_entities - total_queried)
+                print(f"  正在查询第 {batch_num} 批数据 (最多 {batch_limit} 条, 进度: {total_queried}/{num_entities})...")
+                
+                batch_results = collection.query(
+                    expr=expr if expr else "",
+                    output_fields=fields,
+                    limit=batch_limit
+                )
+                
+                if not batch_results:
+                    break
+                
+                results.extend(batch_results)
+                total_queried += len(batch_results)
+                
+                if len(batch_results) < batch_limit:
+                    break
     
     return results
 
