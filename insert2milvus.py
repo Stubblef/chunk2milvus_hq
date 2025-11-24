@@ -14,8 +14,45 @@ import json
 import csv
 import sys
 import gc
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from pathlib import Path
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # 简单的进度条替代
+    class tqdm:
+        def __init__(self, iterable=None, total=None, desc=None, unit=None):
+            self.iterable = iterable
+            self.total = total
+            self.desc = desc or ""
+            self.unit = unit or "it"
+            self.n = 0
+        
+        def __iter__(self):
+            return iter(self.iterable) if self.iterable else self
+        
+        def __next__(self):
+            if self.iterable:
+                return next(self.iterable)
+            raise StopIteration
+        
+        def update(self, n=1):
+            self.n += n
+            if self.total:
+                percent = (self.n / self.total) * 100
+                print(f"\r{self.desc}: {self.n}/{self.total} ({percent:.1f}%)", end='', flush=True)
+        
+        def close(self):
+            print()  # 换行
+        
+        def __enter__(self):
+            return self
+        
+        def __exit__(self, *args):
+            self.close()
 
 from chunk2milvus_hq import MilvusClient, EmbeddingService
 from pymilvus import FieldSchema, DataType, CollectionSchema
@@ -215,14 +252,84 @@ def infer_schema_from_data(
     return fields
 
 
+def get_existing_pks(
+    client: MilvusClient,
+    collection_name: str,
+    pk_field_name: str,
+    pk_values: List[Any],
+    batch_size: int = 500
+) -> Set[Any]:
+    """
+    查询已存在的主键值（分批查询，避免表达式过长和内存溢出）
+    
+    Args:
+        batch_size: 每批查询的主键数量（默认500，避免表达式过长）
+    
+    Returns:
+        已存在的主键集合
+    """
+    if not pk_values:
+        return set()
+    
+    collection = client.get_collection(collection_name)
+    collection.load()
+    
+    # 获取主键字段类型
+    pk_field = next((f for f in collection.schema.fields if f.name == pk_field_name), None)
+    if not pk_field:
+        return set()
+    
+    existing_pks = set()
+    
+    # 分批查询，避免表达式过长和内存占用过大
+    for i in range(0, len(pk_values), batch_size):
+        batch_pks = pk_values[i:i + batch_size]
+        
+        try:
+            # 构建查询表达式
+            if pk_field.dtype == DataType.VARCHAR:
+                pk_list_str = ", ".join([f'"{pk}"' for pk in batch_pks])
+                expr = f"{pk_field_name} in [{pk_list_str}]"
+            elif pk_field.dtype == DataType.INT64:
+                pk_list_str = ", ".join([str(pk) for pk in batch_pks])
+                expr = f"{pk_field_name} in [{pk_list_str}]"
+            else:
+                pk_list_str = ", ".join([f'"{str(pk)}"' for pk in batch_pks])
+                expr = f"{pk_field_name} in [{pk_list_str}]"
+            
+            # 查询已存在的主键
+            results = collection.query(
+                expr=expr,
+                output_fields=[pk_field_name],
+                limit=len(batch_pks)
+            )
+            
+            # 提取主键值并添加到集合
+            batch_existing = {row[pk_field_name] for row in results}
+            existing_pks.update(batch_existing)
+            
+            # 释放中间变量
+            del results, batch_existing, batch_pks
+        except Exception as e:
+            # 如果查询失败，记录警告但继续处理
+            print(f"  警告: 查询已存在主键失败（批次 {i//batch_size + 1}）: {e}")
+            continue
+    
+    return existing_pks
+
+
 def insert_data_batch(
     client: MilvusClient,
     collection_name: str,
     batch_data: List[Dict[str, Any]],
-    auto_embed: bool = False
+    auto_embed: bool = False,
+    skip_existing: bool = False
 ) -> int:
     """
     插入一批数据到 collection
+    
+    Args:
+        skip_existing: 是否跳过已存在的记录（基于主键）
     
     Returns:
         插入的记录数
@@ -242,14 +349,29 @@ def insert_data_batch(
     if pk_field_name is None:
         raise ValueError("No primary key field found in schema")
     
-    # 准备插入数据（按字段组织）
-    insert_data = {}
+    # 如果需要跳过已存在的记录，先查询已存在的主键
+    existing_pks = None
+    if skip_existing:
+        pk_values = [row.get(pk_field_name) for row in batch_data if row.get(pk_field_name) is not None]
+        if pk_values:
+            # 分批查询，避免内存占用过大
+            existing_pks = get_existing_pks(client, collection_name, pk_field_name, pk_values, batch_size=500)
+            # 过滤掉已存在的记录
+            batch_data = [row for row in batch_data if row.get(pk_field_name) not in existing_pks]
+            # 释放已存在主键集合
+            del existing_pks
+            gc.collect()
+    
+    if not batch_data:
+        return 0  # 所有记录都已存在
+    
     num_rows = len(batch_data)
     
-    # 提取各字段数据
-    for field_name in schema_fields.keys():
-        field_values = []
-        for row in batch_data:
+    # 直接构建按行组织的数据，避免中间数据复制
+    data_rows = []
+    for row in batch_data:
+        data_row = {}
+        for field_name in schema_fields.keys():
             value = row.get(field_name)
             if value is None:
                 # 根据字段类型设置默认值
@@ -266,38 +388,56 @@ def insert_data_batch(
                     value = False
                 elif field.dtype == DataType.FLOAT_VECTOR:
                     value = []
-            field_values.append(value)
-        insert_data[field_name] = field_values
+            data_row[field_name] = value
+        data_rows.append(data_row)
+    
+    # 释放原始批次数据
+    del batch_data
+    gc.collect()
     
     # 如果需要自动向量化且没有向量数据
     if "dense_vector" in schema_fields and auto_embed:
-        if not any(insert_data.get("dense_vector", [])):
-            # 检查是否有 text 字段
-            if "text" in schema_fields and insert_data.get("text"):
-                if client.embedding_service is None:
-                    raise ValueError(
-                        "embedding_service is required for auto embedding. "
-                        "Please provide embedding service configuration."
-                    )
-                print(f"  正在向量化 {num_rows} 个文本块...")
+        # 检查是否需要向量化
+        need_embedding = False
+        text_values = []
+        for row in data_rows:
+            if not row.get("dense_vector"):
+                text_val = row.get("text", "")
+                if text_val:
+                    need_embedding = True
+                    text_values.append(text_val)
+                else:
+                    text_values.append("")
+            else:
+                text_values.append("")
+        
+        if need_embedding and client.embedding_service:
+            # 只向量化有文本的行
+            texts_to_embed = [text for text in text_values if text]
+            if texts_to_embed:
+                # 向量化时不显示进度条（避免与主进度条冲突）
                 vectors = client.embedding_service.embeddings(
-                    insert_data["text"],
+                    texts_to_embed,
                     batch_size=10,
-                    show_progress=True
+                    show_progress=False
                 )
-                insert_data["dense_vector"] = vectors
-    
-    # 转换为按行组织的数据
-    data_rows = []
-    for i in range(num_rows):
-        row = {}
-        for field_name, field_values in insert_data.items():
-            row[field_name] = field_values[i]
-        data_rows.append(row)
+                # 将向量分配回对应的行
+                vector_idx = 0
+                for i, row in enumerate(data_rows):
+                    if text_values[i]:
+                        row["dense_vector"] = vectors[vector_idx]
+                        vector_idx += 1
+                # 释放中间变量
+                del vectors, texts_to_embed, text_values
+                gc.collect()
     
     # 插入数据
     insert_result = collection.insert(data_rows)
     collection.flush()
+    
+    # 释放数据
+    del data_rows
+    gc.collect()
     
     return num_rows
 
@@ -319,6 +459,9 @@ def main():
 
   # 批量插入，每批 500 条
   python insert2milvus.py -f data.csv -c my_collection --batch-size 500
+
+  # 跳过已存在的记录（基于主键）
+  python insert2milvus.py -f data.csv -c my_collection --skip-existing
         """
     )
     
@@ -376,6 +519,12 @@ def main():
         "--auto-embed",
         action="store_true",
         help="自动向量化（需要提供 embedding_service）"
+    )
+    
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="跳过已存在的记录（基于主键判断）"
     )
     
     parser.add_argument(
@@ -491,8 +640,45 @@ def main():
         
         # 读取并插入数据
         print(f"\n正在从文件 '{args.file}' 读取数据并插入到 collection '{args.collection}'...")
-        total_inserted = 0
-        batch_num = 0
+        
+        # 先统计总行数（用于进度条）- 使用流式统计，避免加载整个文件到内存
+        print("  正在统计文件总行数...")
+        total_rows = 0
+        if file_ext == '.csv':
+            # CSV 文件：流式读取统计
+            with open(args.file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                # 使用生成器表达式，避免一次性加载所有数据
+                total_rows = sum(1 for _ in reader)
+        else:
+            # JSON 文件：尝试流式统计（如果文件很大）
+            try:
+                # 先尝试快速统计（只读取结构）
+                with open(args.file, 'r', encoding='utf-8') as f:
+                    # 对于大文件，使用流式解析（如果可能）
+                    # 这里简化处理，对于 JSON 数组，需要完整加载
+                    # 但我们可以先检查文件大小，如果太大就使用动态统计
+                    import os
+                    file_size = os.path.getsize(args.file)
+                    if file_size > 100 * 1024 * 1024:  # 大于 100MB
+                        print("  警告: JSON 文件较大，将使用动态统计（可能不准确）")
+                        total_rows = None  # 使用 None 表示未知
+                    else:
+                        data = json.load(f)
+                        total_rows = len(data) if isinstance(data, list) else 1
+                        del data  # 立即释放
+                        gc.collect()
+            except Exception as e:
+                print(f"  警告: 无法统计 JSON 文件行数: {e}，将使用动态统计")
+                total_rows = None
+        
+        if total_rows is None:
+            print("  将使用动态进度显示")
+        elif total_rows > 0:
+            print(f"  文件共有 {total_rows} 条数据")
+        else:
+            print("  警告: 文件为空或无法读取数据")
+            sys.exit(0)
         
         # 读取文件（流式处理）
         if file_ext == '.csv':
@@ -500,34 +686,71 @@ def main():
         else:
             data_reader = read_json_file(args.file, batch_size=args.batch_size)
         
-        for batch_data in data_reader:
-            if not batch_data:
-                continue
-            
-            batch_num += 1
-            print(f"  正在插入第 {batch_num} 批数据 ({len(batch_data)} 条)...")
-            
-            try:
-                inserted = insert_data_batch(
-                    client=client,
-                    collection_name=args.collection,
-                    batch_data=batch_data,
-                    auto_embed=args.auto_embed
-                )
-                total_inserted += inserted
-                print(f"    已插入 {inserted} 条数据（累计: {total_inserted}）")
-                
-                # 每10批执行一次垃圾回收
-                if batch_num % 10 == 0:
-                    gc.collect()
-            except Exception as e:
-                print(f"    错误: 插入失败: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc()
-                # 继续处理下一批
-                continue
+        total_inserted = 0
+        total_skipped = 0
+        batch_num = 0
         
-        print(f"\n插入完成！共插入 {total_inserted} 条数据")
+        # 使用进度条（如果总行数未知，使用动态模式）
+        pbar = tqdm(total=total_rows, desc="插入进度", unit="条") if total_rows else tqdm(desc="插入进度", unit="条")
+        
+        try:
+            with pbar:
+                for batch_data in data_reader:
+                    if not batch_data:
+                        continue
+                    
+                    batch_num += 1
+                    batch_size = len(batch_data)
+                    
+                    try:
+                        inserted = insert_data_batch(
+                            client=client,
+                            collection_name=args.collection,
+                            batch_data=batch_data,
+                            auto_embed=args.auto_embed,
+                            skip_existing=args.skip_existing
+                        )
+                        
+                        skipped = batch_size - inserted
+                        total_inserted += inserted
+                        total_skipped += skipped
+                        
+                        # 更新进度条
+                        if total_rows:
+                            pbar.update(batch_size)
+                        else:
+                            pbar.update(batch_size)
+                            pbar.total = total_inserted + total_skipped
+                        
+                        pbar.set_postfix({
+                            '已插入': total_inserted,
+                            '已跳过': total_skipped,
+                            '批次': batch_num
+                        })
+                        
+                        # 每批都执行垃圾回收（对于大数据量很重要）
+                        gc.collect()
+                    except Exception as e:
+                        print(f"\n错误: 插入失败（批次 {batch_num}）: {e}", file=sys.stderr)
+                        import traceback
+                        traceback.print_exc()
+                        # 更新进度条（即使失败也更新）
+                        if total_rows:
+                            pbar.update(batch_size)
+                        else:
+                            pbar.update(batch_size)
+                        # 继续处理下一批
+                        continue
+        finally:
+            # 确保进度条关闭
+            if hasattr(pbar, 'close'):
+                pbar.close()
+        
+        print(f"\n插入完成！")
+        print(f"  共处理: {total_rows} 条")
+        print(f"  已插入: {total_inserted} 条")
+        if args.skip_existing:
+            print(f"  已跳过: {total_skipped} 条（已存在）")
         
     except KeyboardInterrupt:
         print("\n\n操作已取消")
