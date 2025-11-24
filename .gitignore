@@ -210,3 +210,6 @@ uv.lock
 tests/
 
 *json
+output/
+*.csv
+*.json
