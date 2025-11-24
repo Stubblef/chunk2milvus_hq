@@ -318,6 +318,7 @@ def get_existing_pks(
             
             # 提取主键值并添加到集合
             # 确保结果不为空且包含主键字段
+            batch_existing = set()
             if results:
                 batch_existing = {row[pk_field_name] for row in results if pk_field_name in row}
                 existing_pks.update(batch_existing)
@@ -569,6 +570,12 @@ def main():
     )
     
     parser.add_argument(
+        "--skip-count",
+        action="store_true",
+        help="跳过文件行数统计（使用动态进度条，对于大文件可以加快启动速度）"
+    )
+    
+    parser.add_argument(
         "--uri",
         default=None,
         help="Milvus URI（默认: 从环境变量 MILVUS_URI 读取）"
@@ -708,35 +715,40 @@ def main():
         print(f"\n正在从文件 '{args.file}' 读取数据并插入到 collection '{args.collection}'...")
         
         # 先统计总行数（用于进度条）- 使用流式统计，避免加载整个文件到内存
-        print("  正在统计文件总行数...")
-        total_rows = 0
-        if file_ext == '.csv':
-            # CSV 文件：流式读取统计
-            with open(args.file, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                # 使用生成器表达式，避免一次性加载所有数据
-                total_rows = sum(1 for _ in reader)
+        total_rows = None
+        if args.skip_count:
+            print("  跳过文件行数统计（使用动态进度条）")
         else:
-            # JSON 文件：尝试流式统计（如果文件很大）
-            try:
-                # 先尝试快速统计（只读取结构）
-                with open(args.file, 'r', encoding='utf-8') as f:
-                    # 对于大文件，使用流式解析（如果可能）
-                    # 这里简化处理，对于 JSON 数组，需要完整加载
-                    # 但我们可以先检查文件大小，如果太大就使用动态统计
+            print("  正在统计文件总行数...")
+            if file_ext == '.csv':
+                # CSV 文件：直接按行计数（不解析为字典，速度快很多）
+                try:
+                    with open(args.file, 'rb') as f:
+                        # 使用二进制模式读取，速度更快
+                        # 跳过第一行（表头）
+                        next(f, None)
+                        # 直接计数行数（二进制模式，只计数换行符）
+                        total_rows = sum(1 for _ in f)
+                except Exception as e:
+                    print(f"  警告: 统计行数失败: {e}，将使用动态进度条")
+                    total_rows = None
+            else:
+                # JSON 文件：尝试流式统计（如果文件很大）
+                try:
                     import os
                     file_size = os.path.getsize(args.file)
                     if file_size > 100 * 1024 * 1024:  # 大于 100MB
                         print("  警告: JSON 文件较大，将使用动态统计（可能不准确）")
                         total_rows = None  # 使用 None 表示未知
                     else:
-                        data = json.load(f)
-                        total_rows = len(data) if isinstance(data, list) else 1
-                        del data  # 立即释放
-                        gc.collect()
-            except Exception as e:
-                print(f"  警告: 无法统计 JSON 文件行数: {e}，将使用动态统计")
-                total_rows = None
+                        with open(args.file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            total_rows = len(data) if isinstance(data, list) else 1
+                            del data  # 立即释放
+                            gc.collect()
+                except Exception as e:
+                    print(f"  警告: 无法统计 JSON 文件行数: {e}，将使用动态统计")
+                    total_rows = None
         
         if total_rows is None:
             print("  将使用动态进度显示")
