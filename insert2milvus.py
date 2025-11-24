@@ -790,10 +790,12 @@ def main():
                             logger=logger
                         )
                         
-                        # 记录跳过的主键
+                        # 记录跳过的主键（详细记录每个主键值）
                         if skipped_pks:
+                            print(f"\n  批次 {batch_num} 跳过 {len(skipped_pks)} 条已存在的记录:")
                             for pk in skipped_pks:
-                                logger.info(f"SKIPPED: {pk}")
+                                print(f"    - SKIPPED: {pk}")
+                                logger.info(f"SKIPPED: {pk} (批次 {batch_num})")
                             total_skipped += len(skipped_pks)
                         
                         # 记录失败的主键
