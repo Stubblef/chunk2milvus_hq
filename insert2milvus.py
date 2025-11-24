@@ -14,7 +14,9 @@ import json
 import csv
 import sys
 import gc
-from typing import List, Dict, Any, Optional, Set
+import logging
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Set, Tuple
 from pathlib import Path
 
 try:
@@ -274,6 +276,11 @@ def get_existing_pks(
     collection = client.get_collection(collection_name)
     collection.load()
     
+    # 如果 collection 为空，直接返回空集合
+    num_entities = collection.num_entities
+    if num_entities == 0:
+        return set()
+    
     # 获取主键字段类型
     pk_field = next((f for f in collection.schema.fields if f.name == pk_field_name), None)
     if not pk_field:
@@ -298,6 +305,11 @@ def get_existing_pks(
                 expr = f"{pk_field_name} in [{pk_list_str}]"
             
             # 查询已存在的主键
+            # 注意：如果 collection 为空，query 应该返回空列表
+            # 但如果 expr 为空字符串，可能会返回所有数据，所以必须确保 expr 不为空
+            if not expr or expr.strip() == "":
+                continue  # 跳过无效表达式
+            
             results = collection.query(
                 expr=expr,
                 output_fields=[pk_field_name],
@@ -305,8 +317,10 @@ def get_existing_pks(
             )
             
             # 提取主键值并添加到集合
-            batch_existing = {row[pk_field_name] for row in results}
-            existing_pks.update(batch_existing)
+            # 确保结果不为空且包含主键字段
+            if results:
+                batch_existing = {row[pk_field_name] for row in results if pk_field_name in row}
+                existing_pks.update(batch_existing)
             
             # 释放中间变量
             del results, batch_existing, batch_pks
@@ -323,16 +337,18 @@ def insert_data_batch(
     collection_name: str,
     batch_data: List[Dict[str, Any]],
     auto_embed: bool = False,
-    skip_existing: bool = False
-) -> int:
+    skip_existing: bool = False,
+    logger: Optional[logging.Logger] = None
+) -> Tuple[int, List[Any], List[Any]]:
     """
     插入一批数据到 collection
     
     Args:
         skip_existing: 是否跳过已存在的记录（基于主键）
+        logger: 日志记录器（可选）
     
     Returns:
-        插入的记录数
+        (插入的记录数, 跳过的主键列表, 失败的主键列表)
     """
     collection = client.get_collection(collection_name)
     
@@ -350,20 +366,26 @@ def insert_data_batch(
         raise ValueError("No primary key field found in schema")
     
     # 如果需要跳过已存在的记录，先查询已存在的主键
+    skipped_pks = []
     existing_pks = None
     if skip_existing:
         pk_values = [row.get(pk_field_name) for row in batch_data if row.get(pk_field_name) is not None]
         if pk_values:
             # 分批查询，避免内存占用过大
             existing_pks = get_existing_pks(client, collection_name, pk_field_name, pk_values, batch_size=500)
+            
+            # 记录跳过的主键
+            skipped_pks = [row.get(pk_field_name) for row in batch_data if row.get(pk_field_name) in existing_pks]
+            
             # 过滤掉已存在的记录
             batch_data = [row for row in batch_data if row.get(pk_field_name) not in existing_pks]
+            
             # 释放已存在主键集合
             del existing_pks
             gc.collect()
     
     if not batch_data:
-        return 0  # 所有记录都已存在
+        return (0, skipped_pks, [])  # 所有记录都已存在
     
     num_rows = len(batch_data)
     
@@ -431,15 +453,28 @@ def insert_data_batch(
                 del vectors, texts_to_embed, text_values
                 gc.collect()
     
-    # 插入数据
-    insert_result = collection.insert(data_rows)
-    collection.flush()
+    # 保存主键列表（用于错误处理）
+    inserted_pks = [row.get(pk_field_name) for row in data_rows if row.get(pk_field_name) is not None]
+    failed_pks = []
+    
+    try:
+        # 插入数据
+        insert_result = collection.insert(data_rows)
+        collection.flush()
+    except Exception as e:
+        # 插入失败，记录所有主键
+        failed_pks = inserted_pks.copy()
+        if logger:
+            logger.error(f"批量插入失败: {e}")
+            for pk in failed_pks:
+                logger.error(f"FAILED: {pk}")
+        raise
     
     # 释放数据
     del data_rows
     gc.collect()
     
-    return num_rows
+    return (num_rows, skipped_pks, failed_pks)
 
 
 def main():
@@ -528,6 +563,12 @@ def main():
     )
     
     parser.add_argument(
+        "--log-file",
+        default=None,
+        help="日志文件路径（记录跳过和失败的主键，默认: {collection_name}_insert.log）"
+    )
+    
+    parser.add_argument(
         "--uri",
         default=None,
         help="Milvus URI（默认: 从环境变量 MILVUS_URI 读取）"
@@ -577,6 +618,31 @@ def main():
         
         conn_info = client.get_connection_info()
         print(f"连接成功: {conn_info.get('address', 'N/A')}")
+        
+        # 设置日志记录器
+        log_file = args.log_file or f"{args.collection}_insert.log"
+        logger = logging.getLogger('insert2milvus')
+        logger.setLevel(logging.INFO)
+        
+        # 清除已有的处理器
+        logger.handlers.clear()
+        
+        # 文件处理器：记录跳过和失败的主键
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+        
+        # 控制台处理器：只记录重要信息
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        logger.addHandler(console_handler)
+        
+        logger.info(f"开始插入数据到 collection: {args.collection}")
+        logger.info(f"输入文件: {args.file}")
+        if args.skip_existing:
+            logger.info("启用跳过已存在记录功能")
         
         # 检查 collection 是否存在
         collection_exists = client.has_collection(args.collection)
@@ -703,17 +769,27 @@ def main():
                     batch_size = len(batch_data)
                     
                     try:
-                        inserted = insert_data_batch(
+                        inserted, skipped_pks, failed_pks = insert_data_batch(
                             client=client,
                             collection_name=args.collection,
                             batch_data=batch_data,
                             auto_embed=args.auto_embed,
-                            skip_existing=args.skip_existing
+                            skip_existing=args.skip_existing,
+                            logger=logger
                         )
                         
-                        skipped = batch_size - inserted
+                        # 记录跳过的主键
+                        if skipped_pks:
+                            for pk in skipped_pks:
+                                logger.info(f"SKIPPED: {pk}")
+                            total_skipped += len(skipped_pks)
+                        
+                        # 记录失败的主键
+                        if failed_pks:
+                            for pk in failed_pks:
+                                logger.error(f"FAILED: {pk}")
+                        
                         total_inserted += inserted
-                        total_skipped += skipped
                         
                         # 更新进度条
                         if total_rows:
@@ -734,6 +810,16 @@ def main():
                         print(f"\n错误: 插入失败（批次 {batch_num}）: {e}", file=sys.stderr)
                         import traceback
                         traceback.print_exc()
+                        
+                        # 记录整个批次失败的主键
+                        collection = client.get_collection(args.collection)
+                        schema_fields = {field.name: field for field in collection.schema.fields}
+                        pk_field_name = next((name for name, field in schema_fields.items() if field.is_primary), None)
+                        if pk_field_name:
+                            failed_pks = [row.get(pk_field_name) for row in batch_data if row.get(pk_field_name) is not None]
+                            for pk in failed_pks:
+                                logger.error(f"FAILED: {pk} (批次 {batch_num} 插入失败: {str(e)})")
+                        
                         # 更新进度条（即使失败也更新）
                         if total_rows:
                             pbar.update(batch_size)
@@ -751,6 +837,10 @@ def main():
         print(f"  已插入: {total_inserted} 条")
         if args.skip_existing:
             print(f"  已跳过: {total_skipped} 条（已存在）")
+        
+        # 记录完成信息到日志
+        logger.info(f"插入完成 - 共处理: {total_rows} 条, 已插入: {total_inserted} 条, 已跳过: {total_skipped} 条")
+        print(f"\n日志文件: {log_file}")
         
     except KeyboardInterrupt:
         print("\n\n操作已取消")
