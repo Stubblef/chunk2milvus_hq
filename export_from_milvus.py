@@ -84,7 +84,8 @@ def query_collection(
             if pk_field:
                 # 使用主键范围查询来分批获取数据
                 # 先获取所有主键（分批获取）
-                all_pks = []
+                all_pks_set = set()  # 使用 set 去重
+                all_pks = []  # 保持顺序的列表
                 pk_batch_size = MAX_QUERY_LIMIT
                 pk_offset = 0
                 
@@ -99,10 +100,16 @@ def query_collection(
                     if not pk_batch:
                         break
                     
-                    all_pks.extend([row[pk_field] for row in pk_batch])
-                    pk_offset += len(pk_batch)
+                    # 去重并保持顺序
+                    for row in pk_batch:
+                        pk_value = row[pk_field]
+                        if pk_value not in all_pks_set:
+                            all_pks_set.add(pk_value)
+                            all_pks.append(pk_value)
                     
-                    if len(pk_batch) < pk_batch_limit:
+                    pk_offset = len(all_pks)  # 使用实际去重后的数量
+                    
+                    if len(pk_batch) < pk_batch_limit or len(all_pks) >= limit:
                         break
                 
                 # 使用主键列表分批查询数据
@@ -234,7 +241,8 @@ def query_collection(
             # 使用主键分批查询
             # 先分批获取所有主键（流式处理，不全部保存在内存）
             print("  正在获取主键列表...")
-            all_pks = []
+            all_pks_set = set()  # 使用 set 去重
+            all_pks = []  # 保持顺序的列表
             pk_batch_size = MAX_QUERY_LIMIT
             pk_offset = 0
             
@@ -249,11 +257,16 @@ def query_collection(
                 if not pk_batch:
                     break
                 
-                batch_pks = [row[pk_field] for row in pk_batch]
-                all_pks.extend(batch_pks)
-                pk_offset += len(pk_batch)
+                # 去重并保持顺序
+                for row in pk_batch:
+                    pk_value = row[pk_field]
+                    if pk_value not in all_pks_set:
+                        all_pks_set.add(pk_value)
+                        all_pks.append(pk_value)
                 
-                print(f"    已获取 {len(all_pks)}/{num_entities} 个主键...")
+                pk_offset = len(all_pks)  # 使用实际去重后的数量
+                
+                print(f"    已获取 {len(all_pks)}/{num_entities} 个主键（已去重）...")
                 
                 if len(pk_batch) < pk_batch_limit:
                     break
@@ -354,16 +367,25 @@ def query_collection(
 
 class StreamingJSONWriter:
     """流式 JSON 写入器"""
-    def __init__(self, output_file: str):
+    def __init__(self, output_file: str, pk_field: Optional[str] = None):
         self.output_file = output_file
         self.file = open(output_file, 'w', encoding='utf-8')
         self.file.write('[\n')
         self.first_item = True
         self.count = 0
+        self.pk_field = pk_field
+        self.seen_pks = set()  # 用于去重的主键集合
     
     def write(self, data: List[Dict[str, Any]]):
         """写入一批数据"""
         for item in data:
+            # 如果指定了主键字段，进行去重
+            if self.pk_field and self.pk_field in item:
+                pk_value = item[self.pk_field]
+                if pk_value in self.seen_pks:
+                    continue  # 跳过重复的主键
+                self.seen_pks.add(pk_value)
+            
             if not self.first_item:
                 self.file.write(',\n')
             json.dump(item, self.file, ensure_ascii=False, indent=2)
@@ -379,13 +401,15 @@ class StreamingJSONWriter:
 
 class StreamingCSVWriter:
     """流式 CSV 写入器"""
-    def __init__(self, output_file: str, fieldnames: Optional[List[str]] = None):
+    def __init__(self, output_file: str, fieldnames: Optional[List[str]] = None, pk_field: Optional[str] = None):
         self.output_file = output_file
         self.file = open(output_file, 'w', encoding='utf-8', newline='')
         self.fieldnames = fieldnames
         self.writer = None
         self.header_written = False
         self.count = 0
+        self.pk_field = pk_field
+        self.seen_pks = set()  # 用于去重的主键集合
     
     def write(self, data: List[Dict[str, Any]]):
         """写入一批数据"""
@@ -402,6 +426,13 @@ class StreamingCSVWriter:
         
         # 写入数据
         for row in data:
+            # 如果指定了主键字段，进行去重
+            if self.pk_field and self.pk_field in row:
+                pk_value = row[self.pk_field]
+                if pk_value in self.seen_pks:
+                    continue  # 跳过重复的主键
+                self.seen_pks.add(pk_value)
+            
             # 处理复杂数据类型（如列表、字典）转换为字符串
             processed_row = {}
             for key, value in row.items():
@@ -621,14 +652,21 @@ def main():
             # 使用流式写入，避免内存溢出
             print("  使用流式写入模式（避免内存溢出）...")
             
-            # 获取字段列表（用于CSV写入器）
+            # 获取字段列表和主键字段（用于CSV写入器和去重）
+            collection = client.get_collection(args.collection)
+            collection.load()
+            schema_fields = {field.name: field for field in collection.schema.fields}
+            
+            # 获取主键字段名
+            pk_field = None
+            for field in collection.schema.fields:
+                if field.is_primary:
+                    pk_field = field.name
+                    break
+            
             if args.fields:
                 fieldnames = args.fields
             else:
-                # 需要从collection schema获取字段列表
-                collection = client.get_collection(args.collection)
-                collection.load()
-                schema_fields = {field.name: field for field in collection.schema.fields}
                 fieldnames = [name for name, field in schema_fields.items()]
             
             # 创建写入器
@@ -656,9 +694,9 @@ def main():
                         print(f"\n  开始写入文件: {new_file}")
                         
                         if args.format == "json":
-                            current_writer = StreamingJSONWriter(str(new_file))
+                            current_writer = StreamingJSONWriter(str(new_file), pk_field=pk_field)
                         else:
-                            current_writer = StreamingCSVWriter(str(new_file), fieldnames)
+                            current_writer = StreamingCSVWriter(str(new_file), fieldnames, pk_field=pk_field)
                     
                     # 写入数据
                     current_writer.write(batch_data)
@@ -688,10 +726,19 @@ def main():
                 print(f"\n导出完成！共生成 {file_counter} 个文件")
             else:
                 # 流式写入到单个文件
+                # 获取主键字段名（用于去重）
+                collection = client.get_collection(args.collection)
+                collection.load()
+                pk_field = None
+                for field in collection.schema.fields:
+                    if field.is_primary:
+                        pk_field = field.name
+                        break
+                
                 if args.format == "json":
-                    writer = StreamingJSONWriter(output_file)
+                    writer = StreamingJSONWriter(output_file, pk_field=pk_field)
                 else:
-                    writer = StreamingCSVWriter(output_file, fieldnames)
+                    writer = StreamingCSVWriter(output_file, fieldnames, pk_field=pk_field)
                 
                 def batch_callback(batch_data: List[Dict[str, Any]]):
                     writer.write(batch_data)
@@ -727,6 +774,32 @@ def main():
             if not data:
                 print("警告: 没有数据可导出")
                 sys.exit(0)
+            
+            # 基于主键去重
+            collection = client.get_collection(args.collection)
+            collection.load()
+            pk_field = None
+            for field in collection.schema.fields:
+                if field.is_primary:
+                    pk_field = field.name
+                    break
+            
+            if pk_field:
+                seen_pks = set()
+                deduplicated_data = []
+                for row in data:
+                    if pk_field in row:
+                        pk_value = row[pk_field]
+                        if pk_value not in seen_pks:
+                            seen_pks.add(pk_value)
+                            deduplicated_data.append(row)
+                    else:
+                        # 如果没有主键字段，保留所有数据
+                        deduplicated_data.append(row)
+                
+                if len(deduplicated_data) < len(data):
+                    print(f"  去重: {len(data)} 条 -> {len(deduplicated_data)} 条（基于主键 {pk_field}）")
+                data = deduplicated_data
             
             # 导出数据
             print(f"\n正在导出数据到 {args.format.upper()} 文件...")
