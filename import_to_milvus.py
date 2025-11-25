@@ -51,7 +51,7 @@ def main():
     args = parser.parse_args()
     
     # 初始化客户端
-    client = MilvusClient(uri="http://8.130.130.118:19530",token="root:wjaKnxKUxtA0Qgmc",database=args.database)
+    client = MilvusClient(uri="http://127.0.0.1:19530",token="root:wjaKnxKUxtA0Qgmc",database=args.database)
     # client.list_collections()
     
     fields = [
