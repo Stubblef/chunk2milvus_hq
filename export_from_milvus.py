@@ -5,6 +5,7 @@ import sys
 import gc
 from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
+from tqdm import tqdm
 
 from chunk2milvus_hq import MilvusClient
 
@@ -32,6 +33,10 @@ last_pk = None
 
 # 输出文件（JSONL 格式）
 output_file = "all_pks.jsonl"
+
+# 创建进度条
+pbar = tqdm(total=num_entities, desc="导出数据", unit="条", unit_scale=True)
+
 with open(output_file, "w", encoding="utf-8") as f:
     while True:
         if last_pk is None:
@@ -66,6 +71,11 @@ with open(output_file, "w", encoding="utf-8") as f:
         # 更新游标
         last_pk = batch_pks[-1]
         
-        print(f"已写入 {last_pk}")
+        # 更新进度条
+        pbar.update(len(batch_pks))
+        pbar.set_postfix({"当前PK": last_pk})
+
+# 关闭进度条
+pbar.close()
 
 print(f"共获取到 PK 数量: {len(all_pks)}")
